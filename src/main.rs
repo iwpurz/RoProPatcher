@@ -1,190 +1,232 @@
-// Dependencies
-use terminal_menu::{run, menu, label, scroll, string, submenu, back_button, button, mut_menu, list};
-use zip_extensions::zip_create_from_directory;
-use std::{path::PathBuf, fs::{self, File}, io::{Cursor, Write}};
-use platform_dirs::AppDirs;
-use crx_dl::{ChromeCRXQuery, crx_to_zip};
+use anyhow::{Context, Result};
+use inquire::{Select, Text};
+use regex::Regex;
+use std::{
+    fs::{self, File},
+    io::{Cursor, Write},
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+use zip_extensions::{zip_create_from_directory, zip_extract};
 
-// Constants
-const PROXIES_URL: &str = "https://raw.githubusercontent.com/Stefanuk12/RoProPatcher/master/proxies.txt";
+const PROXIES_URL: &str =
+    "https://raw.githubusercontent.com/Stefanuk12/RoProPatcher/master/proxies.txt";
 
-/// Fetches each proxy.
-fn get_proxies() -> Vec<String> {
-    reqwest::blocking::Client::new()
-        .get(PROXIES_URL)
-        .send()
-        .expect("unable to grab proxies")
-        .text()
-        .expect("invalid proxies")
-        .lines()
-        .map(|x| x.to_string())
-        .collect()
+// Cache compiled regex to avoid recompiling inside loops
+static PATCH_REGEX: OnceLock<Regex> = OnceLock::new();
+
+fn get_patch_regex() -> &'static Regex {
+    PATCH_REGEX.get_or_init(|| {
+        Regex::new(
+            r#"(https://api\.)ropro\.io/(validateUser\.php|getServerInfo\.php|getServerConnectionScore\.php|getServerAge\.php|getSubscription\.php)"#,
+        )
+        .expect("Failed to compile patch regex")
+    })
 }
 
-/// Performs the entire patching process.
-fn patch(path: PathBuf, proxy: String) {
-    // The regex replace thing. We don't want to proxy everything, only the stuff that needs verification
-    let re = regex::Regex::new(r#"(https://api\.)ropro\.io/(validateUser\.php|getServerInfo\.php|getServerConnectionScore\.php|getServerAge\.php|getSubscription\.php)"#).unwrap();
+/// Fetches list of proxy endpoints asynchronously via reqwest 0.13.
+async fn get_proxies() -> Result<Vec<String>> {
+    let response = reqwest::get(PROXIES_URL)
+        .await
+        .context("Failed to request proxies list")?
+        .text()
+        .await
+        .context("Failed to read proxies response text")?;
+
+    let proxies: Vec<String> = response
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if proxies.is_empty() {
+        anyhow::bail!("Proxy list downloaded but contained no valid entries");
+    }
+
+    Ok(proxies)
+}
+
+/// Modifies targeted API URLs inside JS files to redirect through the proxy.
+fn patch_file(file_path: &Path, replacement: &str) -> Result<bool> {
+    if !file_path.is_file() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(file_path)
+        .with_context(|| format!("Unable to read file: {:?}", file_path))?;
+
+    let re = get_patch_regex();
+    let new_contents = re.replace_all(&contents, replacement).to_string();
+
+    if contents != new_contents {
+        fs::write(file_path, new_contents)
+            .with_context(|| format!("Unable to write patched contents to: {:?}", file_path))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Performs patching across target extension directories.
+fn patch_extension_dir(base_path: &Path, proxy: &str) -> Result<()> {
     let rep = format!("https://{}/${{2}}///api", proxy);
 
-    // Patching the background file
-    let background = path.join("background.js");
-    let background_contents = fs::read_to_string(&background).expect("Unable to open file (background.js)");
-    let new_background_contents = re.replace_all(&background_contents, &rep).to_string();
-    fs::write(&background, new_background_contents.clone()).expect("Unable to write file contents (background.js)");
-
-    // Checking if they changed
-    if background_contents == new_background_contents {
-        println!("warning: nothing changed while patching `background.js` (and possibly others within js/page) - already patched?");
+    // 1. Patch background.js
+    let background_path = base_path.join("background.js");
+    if background_path.exists() {
+        if !patch_file(&background_path, &rep)? {
+            println!("Warning: No changes made to `background.js` (already patched?).");
+        }
+    } else {
+        println!("Warning: `background.js` not found in target path.");
     }
 
-    // Patching each file in js/page
-    let jspage = path.join("js/page");
-    for dir_entry in fs::read_dir(jspage).unwrap() {
-        // Get the file path
-        let file = dir_entry.unwrap();
-        let file_name = format!("js/page/{}", file.file_name().to_str().unwrap());
-        let file_path = file.path();
-    
-        // Patch the file
-        let file_data = fs::read_to_string(file_path.clone()).unwrap_or_else(|_| panic!("Unable to open file ({})", file_name));
-        let new_file_data = re.replace_all(&file_data, &rep).to_string();
-        fs::write(file_path.clone(), new_file_data.clone()).unwrap_or_else(|_| panic!("Unable to write file contents ({})", file_name));
+    // 2. Patch all JS files inside js/page directory
+    let jspage_path = base_path.join("js/page");
+    if jspage_path.exists() && jspage_path.is_dir() {
+        for entry in fs::read_dir(jspage_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("js") {
+                patch_file(&path, &rep)?;
+            }
+        }
     }
+
+    Ok(())
 }
 
-/// Downloads RoPro source.
-fn download_extension() -> Vec<u8> {
-    // Download the extension
-    let mut crx_query = ChromeCRXQuery::default();
-    crx_query.x = "adbacgifemdbhdkfppmeilbgppmhaobf";
-    let extension_crx = crx_query.download_blocking().unwrap();
+/// Downloads RoPro source .crx package via direct HTTP and converts to ZIP buffer.
+async fn download_extension_bytes() -> Result<Vec<u8>> {
+    let crx_url = "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=100.0&x=id%3Dadbacgifemdbhdkfppmeilbgppmhaobf%26uc";
 
-    // Convert it to .zip
-    let crx_zip = crx_to_zip(extension_crx, None).unwrap();
+    let response_bytes = reqwest::get(crx_url)
+        .await
+        .context("Failed to download CRX package from Web Store")?
+        .bytes()
+        .await
+        .context("Failed to read CRX response bytes")?;
 
-    // Done
-    crx_zip
+    Ok(response_bytes.to_vec())
 }
 
-/// Downloads RoPro source, then output to file as `.zip`.
-fn download_extract() {
-    // Download the extension's source
-    let extension_source = download_extension();
+/// Downloads RoPro source and saves directly to a local .zip file.
+async fn download_extract() -> Result<()> {
+    println!("Downloading RoPro extension source...");
+    let extension_bytes = download_extension_bytes().await?;
 
-    // Output to file
-    let mut file_out = File::create(format!("{}.zip", "RoPro")).unwrap();
-    file_out.write_all(&extension_source).unwrap();
+    let mut file_out = File::create("RoPro.zip").context("Failed to create RoPro.zip")?;
+    file_out.write_all(&extension_bytes)?;
 
-    // Output
-    println!("Downloaded RoPro.");
+    println!("Downloaded RoPro source to RoPro.zip.");
+    Ok(())
 }
 
-/// Downloads RoPro source and patches automatically.
-fn download_patch(selected_proxy: String) {
-    // Download the extension's source
-    let extension_source = download_extension();
+/// Downloads RoPro source, extracts, patches, and prepares directory.
+async fn download_patch(selected_proxy: &str) -> Result<()> {
+    println!("Downloading RoPro extension source...");
+    let extension_bytes = download_extension_bytes().await?;
 
-    // Extract the extension
     let extract_dir = PathBuf::from("RoPro");
-    zip_extract::extract(Cursor::new(extension_source), &extract_dir, true).unwrap();
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir)?;
+    }
 
-    // Patch
-    patch(extract_dir, selected_proxy.to_string());
-    println!("Finished patching.");
+    let mut cursor = Cursor::new(extension_bytes);
+    zip_extract(&mut cursor, &extract_dir).context("Failed to extract ZIP archive")?;
+
+    patch_extension_dir(&extract_dir, selected_proxy)?;
+    println!("Finished downloading and patching.");
+    Ok(())
 }
 
-/// Entrypoint.
-fn main() {
-    // Grab all proxies
-    let proxies = get_proxies();
+/// Main entry point supporting CLI automation and interactive menu.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let proxies = get_proxies().await.unwrap_or_else(|err| {
+        eprintln!("Warning: Could not fetch proxies list ({}), fallback to default.", err);
+        vec!["127.0.0.1:8080".to_string()]
+    });
 
-    // Grab vars, checking if using automated process
     let args: Vec<String> = std::env::args().collect();
+
+    // ---------------------------------------------------------
+    // Unattended CLI Mode: run via `cargo run -- <proxy_idx|proxy_str>`
+    // ---------------------------------------------------------
     if args.len() == 2 {
-        // Figure out which proxy we are using
-        let arg = args.get(1).unwrap();
-        let selected_proxy = if arg.chars().next().unwrap().is_numeric() {
+        let arg = &args[1];
+        let selected_proxy = if let Ok(idx) = arg.parse::<usize>() {
             proxies
-                .get(arg.parse::<usize>().unwrap())
-                .expect("unable to get proxy index")
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| arg.to_string())
         } else {
-            arg
+            arg.to_string()
         };
 
-        // Download and patch
-        download_patch(selected_proxy.to_string());
+        download_patch(&selected_proxy).await?;
 
-        // Zip up
         let source_dir = PathBuf::from("RoPro");
-        zip_create_from_directory(&PathBuf::from("RoPro-PATCHED.zip"), &source_dir)
-            .expect("unable to create zip");
+        let zip_out = PathBuf::from("RoPro-PATCHED.zip");
 
-        // Delete directory
-        fs::remove_dir_all(source_dir)
-            .expect("unable to remove RoPro folder");
+        zip_create_from_directory(&zip_out, &source_dir)
+            .context("Unable to create output ZIP archive")?;
 
-        // Done
-        return
+        fs::remove_dir_all(source_dir).context("Unable to clean up RoPro directory")?;
+
+        println!("Automation complete! Saved output to {}", zip_out.display());
+        return Ok(());
     }
 
-    // Construct the menu and run it
-    let menu = menu(vec![
-        label("-------------------------"),
-        label("-     RoPro Patcher     -"),
-        label("- Created by Stefanuk12 -"),
-        label("-------------------------"),
-        submenu("Custom Patch", vec![
-            label      ("-----------------------------------"),
-            label      ("-     RoPro Patcher - Patcher     -"),
-            label      ("-      Created by Stefanuk12      -"),
-            label      ("-----------------------------------"),
-            scroll     ("Select a proxy", proxies.clone()),
-            string     ("Custom proxy (overwrites)", "", true),
-            label      ("--------------"),
-            string     ("RoPro Path", "./", false),
-            list       ("Use Opera GX Path", vec!["No", "Yes"]),
-            label      ("--------------"),
-            button     ("Start"),
-            back_button("Back")
-        ]),
-        button("Download RoPro source as .zip"),
-        button("Download and Patch (uses default proxy)"),
-        back_button("Exit")
-    ]);
-    run(&menu);
+    // ---------------------------------------------------------
+    // Interactive TUI Menu Mode using `inquire`
+    // ---------------------------------------------------------
+    println!("-------------------------");
+    println!("-     RoPro Patcher     -");
+    println!("-------------------------");
 
-    // User has exited, process their action
-    let mut mm = mut_menu(&menu);
-    let selected_item = mm.selected_item_name();
-    match selected_item {
-        "Exit" => return println!("Goodbye!"),
-        "Download RoPro source as .zip" => download_extract(),
-        "Download and Patch (uses default proxy)" => download_patch(proxies.get(1).unwrap().to_string()),
-        "Custom Patch" => {
-            // Grab their selected proxy
-            let patch_menu = mm.get_submenu("Custom Patch");
-            let custom_proxy = patch_menu.selection_value("Custom proxy (overwrites)");
-            let selected_proxy = if custom_proxy.is_empty() { patch_menu.selection_value("Select a proxy") } else { custom_proxy }; 
-            
-            // Grab their selected path
-            let selected_path = if patch_menu.selection_value("Use Opera GX Path") == "Yes" {
-                let ext_path = AppDirs::new(Some(r"Opera Software\Opera GX Stable\Extensions\adbacgifemdbhdkfppmeilbgppmhaobf"), false).unwrap().config_dir;
-                fs::read_dir(ext_path)
-                    .expect("extension not installed?")
-                    .flatten()
-                    .filter(|x| x.metadata().unwrap().is_dir())
-                    .max_by_key(|x| x.metadata().unwrap().modified().unwrap())
-                    .unwrap()
-                    .path()
+    let options = vec![
+        "Custom Patch (Local Folder / Custom Proxy)",
+        "Download RoPro source as .zip",
+        "Download and Patch (uses default proxy)",
+        "Exit",
+    ];
+
+    let choice = Select::new("Select an action:", options).prompt()?;
+
+    match choice {
+        "Download RoPro source as .zip" => {
+            download_extract().await?;
+        }
+        "Download and Patch (uses default proxy)" => {
+            if let Some(default_proxy) = proxies.get(0) {
+                download_patch(default_proxy).await?;
             } else {
-                PathBuf::from(patch_menu.selection_value("RoPro Path"))
+                eprintln!("No proxies available to patch with.");
+            }
+        }
+        "Custom Patch (Local Folder / Custom Proxy)" => {
+            let proxy_choice = Select::new("Select a proxy:", proxies.clone()).prompt()?;
+
+            let override_proxy = Text::new("Custom proxy (leave blank to use selected above):")
+                .prompt()?;
+
+            let selected_proxy = if override_proxy.trim().is_empty() {
+                proxy_choice
+            } else {
+                override_proxy.trim().to_string()
             };
 
-            // Patch
-            patch(selected_path, selected_proxy.to_string());
-            println!("Finished patching.");
+            let path_input = Text::new("RoPro folder path:")
+                .with_default("./RoPro")
+                .prompt()?;
+
+            let target_path = PathBuf::from(path_input);
+            patch_extension_dir(&target_path, &selected_proxy)?;
+            println!("Finished patching folder at {:?}", target_path);
         }
-        _ => return println!("You should not be seeing this...")
-    };
+        _ => println!("Goodbye!"),
+    }
+
+    Ok(())
 }
