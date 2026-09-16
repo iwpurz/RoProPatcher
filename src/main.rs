@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use inquire::{Select, Text};
+use inquire::{Confirm, Select, Text};
 use regex::Regex;
 use std::{
     fs::{self, File},
@@ -7,12 +7,11 @@ use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
 };
-use zip_extensions::ZipUtils;
+use zip_extensions::{zip_create_from_directory, zip_extract};
 
 const PROXIES_URL: &str =
     "https://raw.githubusercontent.com/Stefanuk12/RoProPatcher/master/proxies.txt";
 
-// Cache compiled regex to avoid recompiling inside loops
 static PATCH_REGEX: OnceLock<Regex> = OnceLock::new();
 
 fn get_patch_regex() -> &'static Regex {
@@ -24,7 +23,6 @@ fn get_patch_regex() -> &'static Regex {
     })
 }
 
-/// Fetches list of proxy endpoints asynchronously via reqwest 0.13.
 async fn get_proxies() -> Result<Vec<String>> {
     let response = reqwest::get(PROXIES_URL)
         .await
@@ -46,7 +44,6 @@ async fn get_proxies() -> Result<Vec<String>> {
     Ok(proxies)
 }
 
-/// Modifies targeted API URLs inside JS files to redirect through the proxy.
 fn patch_file(file_path: &Path, replacement: &str) -> Result<bool> {
     if !file_path.is_file() {
         return Ok(false);
@@ -67,11 +64,9 @@ fn patch_file(file_path: &Path, replacement: &str) -> Result<bool> {
     }
 }
 
-/// Performs patching across target extension directories.
 fn patch_extension_dir(base_path: &Path, proxy: &str) -> Result<()> {
     let rep = format!("https://{}/${{2}}///api", proxy);
 
-    // 1. Patch background.js
     let background_path = base_path.join("background.js");
     if background_path.exists() {
         if !patch_file(&background_path, &rep)? {
@@ -81,7 +76,6 @@ fn patch_extension_dir(base_path: &Path, proxy: &str) -> Result<()> {
         println!("Warning: `background.js` not found in target path.");
     }
 
-    // 2. Patch all JS files inside js/page directory
     let jspage_path = base_path.join("js/page");
     if jspage_path.exists() && jspage_path.is_dir() {
         for entry in fs::read_dir(jspage_path)? {
@@ -96,7 +90,6 @@ fn patch_extension_dir(base_path: &Path, proxy: &str) -> Result<()> {
     Ok(())
 }
 
-/// Downloads RoPro source .crx package via direct HTTP and converts to ZIP buffer.
 async fn download_extension_bytes() -> Result<Vec<u8>> {
     let crx_url = "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=100.0&x=id%3Dadbacgifemdbhdkfppmeilbgppmhaobf%26uc";
 
@@ -110,7 +103,6 @@ async fn download_extension_bytes() -> Result<Vec<u8>> {
     Ok(response_bytes.to_vec())
 }
 
-/// Downloads RoPro source and saves directly to a local .zip file.
 async fn download_extract() -> Result<()> {
     println!("Downloading RoPro extension source...");
     let extension_bytes = download_extension_bytes().await?;
@@ -122,25 +114,22 @@ async fn download_extract() -> Result<()> {
     Ok(())
 }
 
-/// Downloads RoPro source, extracts, patches, and prepares directory.
-async fn download_patch(selected_proxy: &str) -> Result<()> {
+async fn download_patch(selected_proxy: &str, target_dir: &Path) -> Result<()> {
     println!("Downloading RoPro extension source...");
     let extension_bytes = download_extension_bytes().await?;
 
-    let extract_dir = PathBuf::from("RoPro");
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir)?;
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir)?;
     }
 
     let mut cursor = Cursor::new(extension_bytes);
-    ZipUtils::extract(&mut cursor, &extract_dir).context("Failed to extract ZIP archive")?;
+    zip_extract(&mut cursor, target_dir).context("Failed to extract ZIP archive")?;
 
-    patch_extension_dir(&extract_dir, selected_proxy)?;
-    println!("Finished downloading and patching.");
+    patch_extension_dir(target_dir, selected_proxy)?;
+    println!("Finished downloading and patching to {:?}", target_dir);
     Ok(())
 }
 
-/// Main entry point supporting CLI automation and interactive menu.
 #[tokio::main]
 async fn main() -> Result<()> {
     let proxies = get_proxies().await.unwrap_or_else(|err| {
@@ -150,9 +139,6 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // ---------------------------------------------------------
-    // Unattended CLI Mode: run via `cargo run -- <proxy_idx|proxy_str>`
-    // ---------------------------------------------------------
     if args.len() == 2 {
         let arg = &args[1];
         let selected_proxy = if let Ok(idx) = arg.parse::<usize>() {
@@ -164,12 +150,12 @@ async fn main() -> Result<()> {
             arg.to_string()
         };
 
-        download_patch(&selected_proxy).await?;
-
         let source_dir = PathBuf::from("RoPro");
+        download_patch(&selected_proxy, &source_dir).await?;
+
         let zip_out = PathBuf::from("RoPro-PATCHED.zip");
 
-        ZipUtils::create_from_directory(&zip_out, &source_dir)
+        zip_create_from_directory(&source_dir, &zip_out)
             .context("Unable to create output ZIP archive")?;
 
         fs::remove_dir_all(source_dir).context("Unable to clean up RoPro directory")?;
@@ -178,15 +164,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ---------------------------------------------------------
-    // Interactive TUI Menu Mode using `inquire`
-    // ---------------------------------------------------------
     println!("-------------------------");
     println!("-     RoPro Patcher     -");
     println!("-------------------------");
 
     let options = vec![
-        "Custom Patch (Local Folder / Custom Proxy)",
+        "Custom Patch (Download Fresh / Local Folder / Custom Proxy)",
         "Download RoPro source as .zip",
         "Download and Patch (uses default proxy)",
         "Exit",
@@ -200,12 +183,13 @@ async fn main() -> Result<()> {
         }
         "Download and Patch (uses default proxy)" => {
             if let Some(default_proxy) = proxies.get(0) {
-                download_patch(default_proxy).await?;
+                let default_dir = PathBuf::from("RoPro");
+                download_patch(default_proxy, &default_dir).await?;
             } else {
                 eprintln!("No proxies available to patch with.");
             }
         }
-        "Custom Patch (Local Folder / Custom Proxy)" => {
+        "Custom Patch (Download Fresh / Local Folder / Custom Proxy)" => {
             let proxy_choice = Select::new("Select a proxy:", proxies.clone()).prompt()?;
 
             let override_proxy = Text::new("Custom proxy (leave blank to use selected above):")
@@ -217,13 +201,22 @@ async fn main() -> Result<()> {
                 override_proxy.trim().to_string()
             };
 
-            let path_input = Text::new("RoPro folder path:")
+            let download_fresh = Confirm::new("Download fresh RoPro files before patching?")
+                .with_default(true)
+                .prompt()?;
+
+            let path_input = Text::new("Target folder path:")
                 .with_default("./RoPro")
                 .prompt()?;
 
             let target_path = PathBuf::from(path_input);
-            patch_extension_dir(&target_path, &selected_proxy)?;
-            println!("Finished patching folder at {:?}", target_path);
+
+            if download_fresh {
+                download_patch(&selected_proxy, &target_path).await?;
+            } else {
+                patch_extension_dir(&target_path, &selected_proxy)?;
+                println!("Finished patching local folder at {:?}", target_path);
+            }
         }
         _ => println!("Goodbye!"),
     }
