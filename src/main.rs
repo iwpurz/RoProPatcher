@@ -3,7 +3,7 @@ use inquire::{Confirm, Select, Text};
 use regex::Regex;
 use std::{
     fs::{self, File},
-    io::{Cursor, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -121,9 +121,13 @@ async fn download_patch(selected_proxy: &str, target_dir: &Path) -> Result<()> {
         fs::remove_dir_all(target_dir)?;
     }
 
-    let mut cursor = Cursor::new(extension_bytes);
-    zip_extensions::zip_extract(&mut cursor, target_dir)
+    let temp_zip = PathBuf::from("temp_ropro_download.zip");
+    fs::write(&temp_zip, &extension_bytes).context("Failed to write temporary zip archive")?;
+
+    zip_extensions::zip_extract(&temp_zip, target_dir)
         .context("Failed to extract ZIP archive")?;
+
+    let _ = fs::remove_file(&temp_zip);
 
     patch_extension_dir(target_dir, selected_proxy)?;
     println!("Finished downloading and patching to {:?}", target_dir);
@@ -155,7 +159,7 @@ async fn main() -> Result<()> {
 
         let zip_out = PathBuf::from("RoPro-PATCHED.zip");
 
-        zip_extensions::zip_create_from_directory(&source_dir, &zip_out)
+        zip_extensions::zip_create_from_directory(&zip_out, &source_dir)
             .context("Unable to create output ZIP archive")?;
 
         fs::remove_dir_all(source_dir).context("Unable to clean up RoPro directory")?;
