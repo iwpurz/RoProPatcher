@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
 };
-use zip_extensions::{zip_create_from_directory, zip_extract};
+use zip_extensions::ZipUtils;
 
 const PROXIES_URL: &str =
     "https://raw.githubusercontent.com/Stefanuk12/RoProPatcher/master/proxies.txt";
@@ -133,7 +133,7 @@ async fn download_patch(selected_proxy: &str) -> Result<()> {
     }
 
     let mut cursor = Cursor::new(extension_bytes);
-    zip_extract(&mut cursor, &extract_dir).context("Failed to extract ZIP archive")?;
+    ZipUtils::extract(&mut cursor, &extract_dir).context("Failed to extract ZIP archive")?;
 
     patch_extension_dir(&extract_dir, selected_proxy)?;
     println!("Finished downloading and patching.");
@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
         let source_dir = PathBuf::from("RoPro");
         let zip_out = PathBuf::from("RoPro-PATCHED.zip");
 
-        zip_create_from_directory(&zip_out, &source_dir)
+        ZipUtils::create_from_directory(&zip_out, &source_dir)
             .context("Unable to create output ZIP archive")?;
 
         fs::remove_dir_all(source_dir).context("Unable to clean up RoPro directory")?;
