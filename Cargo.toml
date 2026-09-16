@@ -3,12 +3,10 @@ name = "ropro-patcher"
 version = "2.0.1"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 anyhow = "1"
-inquire = "0.9"
+inquire = "0.7"
 regex = "1"
 zip-extensions = "0.14"
